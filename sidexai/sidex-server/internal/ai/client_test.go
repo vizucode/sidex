@@ -2,6 +2,9 @@ package ai
 
 import (
 	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 )
@@ -20,6 +23,46 @@ func TestNewClientWithoutOpenRouterKey(t *testing.T) {
 	}
 	if c.model == "" {
 		t.Fatalf("expected a default model even without an API key")
+	}
+}
+
+func TestCustomProviderStreamPreservesUpstreamModel(t *testing.T) {
+	for _, model := range []string{"gpt-4o", "anthropic/claude-opus-5", "team/vendor/model", "openai-compatible/model"} {
+		t.Run(model, func(t *testing.T) {
+			called := false
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				called = true
+				if r.URL.Path != "/v1/chat/completions" || r.Header.Get("Authorization") != "Bearer custom-test-key" {
+					t.Errorf("incorrect custom endpoint or authentication")
+				}
+				var body struct {
+					Model string `json:"model"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Error(err)
+				}
+				if body.Model != model {
+					t.Errorf("model = %q, want %q", body.Model, model)
+				}
+				w.Header().Set("Content-Type", "text/event-stream")
+				fmt.Fprint(w, "data: [DONE]\n\n")
+			}))
+			defer server.Close()
+			t.Setenv("SIDEX_PROVIDER_OPENAI-COMPATIBLE_KEY", "custom-test-key")
+			t.Setenv("SIDEX_PROVIDER_OPENAI-COMPATIBLE_BASE_URL", server.URL+"/v1")
+			id := "openai-compatible/" + model
+			cfg, ok := LocalProviderConfig(ProviderFromModelID(id))
+			if !ok {
+				t.Fatal("custom provider not resolved")
+			}
+			client := NewClient().WithModel(id).WithProviderConfig(cfg)
+			if err := client.StreamChat([]Message{{Role: RoleUser, Content: "hello"}}, nil, "", func(StreamChunk) {}); err != nil {
+				t.Fatal(err)
+			}
+			if !called {
+				t.Fatal("custom endpoint not called")
+			}
+		})
 	}
 }
 

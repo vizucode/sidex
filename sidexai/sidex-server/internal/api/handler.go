@@ -369,7 +369,7 @@ func (h *Handler) ListModels(w http.ResponseWriter, r *http.Request) {
 func reachableModels() []cost.ModelInfo {
 	configured := ai.ConfiguredLocalProviders()
 	if len(configured) == 0 {
-		return cost.ListModels()
+		return nil
 	}
 
 	out := make([]cost.ModelInfo, 0, 32)
@@ -401,9 +401,6 @@ func reachableModels() []cost.ModelInfo {
 				Pricing:          cost.LookupPricing(rm.ID),
 			})
 		}
-	}
-	if len(out) == 0 {
-		return cost.ListModels()
 	}
 	return out
 }

@@ -15,6 +15,7 @@ import { LocalToolExecutor, ILocalToolRequest, LOCAL_TOOLS_SUPPORTED } from './l
 import { SubagentRegistry, SubagentType, SUBAGENT_CONFIGS, getAllowedTools, buildSubagentPrompt } from './subagentTypes.js';
 import { IExplorerService } from '../../files/browser/files.js';
 import { resolveServerEndpoint, serverWsUrl, SERVER_RESTARTED_EVENT } from './localServer.js';
+import { shapeSidexModelCatalog } from './sidexModelCatalog.js';
 import { IProductService } from '../../../../platform/product/common/productService.js';
 import { IUpdateService } from '../../../../platform/update/common/update.js';
 import { IRecentEditTracker } from '../../sidexComplete/browser/recentEditTracker.js';
@@ -2053,45 +2054,20 @@ ${prompt}`,
 				}
 			}
 
-			let models = (allModels as Array<{ id: string; name: string; provider: string; default?: boolean; context_window?: number; contextWindow?: number }>).map(m => ({
-				id: m.id,
-				name: m.name,
-				provider: m.provider,
-				contextWindow: m.contextWindow || m.context_window || contextWindowForModel(m.id),
-			}));
-
-			// Custom models (arbitrary OpenRouter IDs added in Settings) are
-			// first-class: append any that aren't already in the server list.
-			if (Array.isArray(customRaw)) {
-				for (const entry of customRaw as Array<string | { id?: string; name?: string }>) {
-					const id = typeof entry === 'string' ? entry : entry?.id;
-					if (id && !models.find(m => m.id === id)) {
-						const name = typeof entry === 'object' && entry?.name ? entry.name : id;
-						models = [...models, { id, name, provider: 'custom' }];
-					}
-				}
+			const shaped = shapeSidexModelCatalog(
+				allModels as Array<{ id: string; name: string; provider: string; context_window?: number; contextWindow?: number }>,
+				enabledRaw,
+				customRaw,
+				this._serverModel,
+				defaultModelId,
+				contextWindowForModel,
+			);
+			this._serverModel = shaped.selectedModel;
+			if (shaped.persistSelected) {
+				try { localStorage.setItem(SidexChatService.MODEL_STORAGE_KEY, this._serverModel); } catch { /* */ }
 			}
-
-			// The server list is live from each connected provider (Claude,
-			// Codex, Ollama, …). Do not filter it down to a hardcoded ID
-			// allowlist — that hides new snapshots the moment a provider
-			// ships them. Custom IDs the user typed are already merged above.
-			this._availableModels = models;
+			this._availableModels = shaped.models;
 			this._onDidChangeModels.fire(this._availableModels);
-
-		// Keep the user's pick when it is still in the live list. Anthropic
-		// returns Opus first; blindly adopting that on every fetch is how a
-		// connected Claude login ends up on a model the current window has
-		// already exhausted.
-		const effective = this._availableModels;
-		const stillOffered = effective.some(m => m.id === this._serverModel);
-		if (!stillOffered && effective.length > 0) {
-			const preferred = effective.find(m => /sonnet/i.test(m.id))
-				|| effective.find(m => /haiku/i.test(m.id))
-				|| effective[0];
-			this._serverModel = preferred.id;
-			try { localStorage.setItem(SidexChatService.MODEL_STORAGE_KEY, this._serverModel); } catch { /* */ }
-		}
 		});
 	}
 }

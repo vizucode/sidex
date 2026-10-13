@@ -4,6 +4,7 @@ import { DisposableStore } from '../../../../../../base/common/lifecycle.js';
 import { Codicon } from '../../../../../../base/common/codicons.js';
 import { ThemeIcon } from '../../../../../../base/common/themables.js';
 import { MentionPopup } from './mentionPopup.js';
+import { filterModelsForQuery } from './modelSearch.js';
 import { MentionResolver, MentionItem } from '../../context/mentionResolver.js';
 import { URI } from '../../../../../../base/common/uri.js';
 import { ISidexChatService } from '../../sidexChatService.js';
@@ -553,6 +554,15 @@ export class ChatInput extends Component {
 				contextPopover.classList.remove('visible');
 				this.element.querySelector('.sc-tray-menu')?.classList.remove('visible');
 				this.element.querySelector('.sc-tray-btn')?.classList.remove('dropdown-active');
+				(modelMenu.querySelector('.sc-model-menu-search-input') as HTMLInputElement | null)?.focus();
+			}
+		});
+		this.on(modelMenu, 'keydown', (e) => {
+			const ke = e as KeyboardEvent;
+			if (ke.key === 'Escape') {
+				ke.preventDefault();
+				modelMenu.classList.remove('visible');
+				modelBtn.focus();
 			}
 		});
 		this.on(document.body, 'click', (e) => {
@@ -846,32 +856,67 @@ export class ChatInput extends Component {
 		menu.innerHTML = '';
 		this._modelCatalog = models;
 
-		if (models.length === 0) {
-			const empty = document.createElement('div');
-			empty.className = 'sc-model-menu-item';
-			empty.style.opacity = '0.7';
-			empty.style.cursor = 'default';
-			empty.textContent = 'No models enabled — enable models in Settings';
-			menu.appendChild(empty);
-		}
+		const searchWrap = document.createElement('div');
+		searchWrap.className = 'sc-model-menu-search';
+		const searchInput = document.createElement('input');
+		searchInput.className = 'sc-model-menu-search-input';
+		searchInput.type = 'search';
+		searchInput.placeholder = 'Search models';
+		searchInput.setAttribute('aria-label', 'Search models');
+		searchWrap.appendChild(searchInput);
+		menu.appendChild(searchWrap);
 
-		for (const m of models) {
-			const item = document.createElement('div');
-			item.className = 'sc-model-menu-item';
-			item.dataset.modelId = m.id;
-			item.textContent = m.name;
-			item.title = m.id;
-			if (m.id === this._currentModel) { item.classList.add('active'); }
-			this._onMenu(item, 'click', () => {
-				this.setModel(m.id);
-				this._onModelChange.fire(m.id);
-				menu.classList.remove('visible');
-				menu.querySelectorAll('.sc-model-menu-item').forEach(el =>
-					(el as HTMLElement).classList.toggle('active', (el as HTMLElement).dataset.modelId === m.id)
-				);
-			});
-			menu.appendChild(item);
-		}
+		const list = document.createElement('div');
+		list.className = 'sc-model-menu-list';
+		list.setAttribute('role', 'listbox');
+		menu.appendChild(list);
+
+		const renderModels = (query: string) => {
+			list.innerHTML = '';
+			const filteredModels = filterModelsForQuery(models, query);
+			if (models.length === 0 || filteredModels.length === 0) {
+				const empty = document.createElement('div');
+				empty.className = 'sc-model-menu-empty';
+				empty.textContent = models.length === 0
+					? 'No models enabled — enable models in Settings'
+					: 'No models match your search';
+				list.appendChild(empty);
+				return;
+			}
+
+			for (const m of filteredModels) {
+				const item = document.createElement('button');
+				item.type = 'button';
+				item.className = 'sc-model-menu-item';
+				item.dataset.modelId = m.id;
+				item.textContent = m.name;
+				item.title = m.id;
+				item.setAttribute('role', 'option');
+				item.setAttribute('aria-selected', String(m.id === this._currentModel));
+				if (m.id === this._currentModel) { item.classList.add('active'); }
+				item.onclick = () => {
+					this.setModel(m.id);
+					this._onModelChange.fire(m.id);
+					menu.classList.remove('visible');
+					menu.querySelectorAll('.sc-model-menu-item').forEach(el => {
+						const active = (el as HTMLElement).dataset.modelId === m.id;
+						(el as HTMLElement).classList.toggle('active', active);
+						el.setAttribute('aria-selected', String(active));
+					});
+				};
+				list.appendChild(item);
+			}
+		};
+
+		renderModels('');
+		this._onMenu(searchInput, 'input', () => renderModels(searchInput.value));
+		this._onMenu(searchInput, 'keydown', (e) => {
+			const ke = e as KeyboardEvent;
+			if (ke.key === 'ArrowDown') {
+				ke.preventDefault();
+				(list.querySelector('.sc-model-menu-item') as HTMLButtonElement | null)?.focus();
+			}
+		});
 
 		// Re-render the footer label now that display names are known.
 		if (this._currentModel) { this.setModel(this._currentModel); }

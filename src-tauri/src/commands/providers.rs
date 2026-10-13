@@ -1347,10 +1347,10 @@ pub struct ProviderModel {
 /// `/` (`ProviderFromModelID`, internal/ai). Anthropic's `/models` endpoint
 /// returns bare ids (`claude-opus-5`) with no prefix at all, so one of those
 /// handed back unqualified would be unroutable; applied to every provider
-/// uniformly since a custom OpenAI-compatible base URL could in principle
-/// return pre-qualified ids too, and those must be left alone.
+/// uniformly. Custom endpoints need an explicit routing prefix even when an
+/// upstream id contains `/`; the server removes that prefix before sending it.
 fn qualify_model_id(provider: &str, id: String) -> String {
-    if id.contains('/') {
+    if provider != "openai-compatible" && id.contains('/') {
         id
     } else {
         format!("{provider}/{id}")
@@ -2157,13 +2157,26 @@ mod tests {
 
     #[test]
     fn qualify_model_id_leaves_an_already_qualified_id_untouched() {
-        // A custom OpenAI-compatible base URL (e.g. an OpenRouter-style
-        // aggregator) can plausibly hand back ids that already carry a
-        // provider prefix; those must not become doubly-prefixed.
+        // Preserve existing OpenRouter catalog ids.
         assert_eq!(
             qualify_model_id("openrouter", "anthropic/claude-opus-5".to_string()),
             "anthropic/claude-opus-5"
         );
+    }
+
+    #[test]
+    fn qualify_model_id_preserves_custom_provider_routing() {
+        for id in [
+            "gpt-4o",
+            "anthropic/claude-opus-5",
+            "team/vendor/model",
+            "openai-compatible/model",
+        ] {
+            assert_eq!(
+                qualify_model_id("openai-compatible", id.to_string()),
+                format!("openai-compatible/{id}")
+            );
+        }
     }
 
     #[test]

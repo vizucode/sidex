@@ -104,6 +104,27 @@ The app looks for a binary at that path automatically when running from a source
 
 ## Getting Started
 
+### Linux prerequisites
+
+On Ubuntu 22.04+/Debian 12+, install Tauri's native build dependencies before running development or production builds:
+
+```bash
+sudo apt update
+sudo apt install build-essential pkg-config libglib2.0-dev libgtk-3-dev \
+  libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+```
+
+`libglib2.0-dev` supplies the `glib-2.0`, `gobject-2.0`, and `gio-2.0` pkg-config files; `libgtk-3-dev` supplies `gdk-3.0`. If Cargo reports these packages as missing, install the development packages rather than setting `PKG_CONFIG_PATH` for libraries that are not installed. Standard distribution packages need no custom `PKG_CONFIG_PATH`.
+
+Verify discovery before retrying `mise run dev` or `npm run tauri dev`:
+
+```bash
+pkg-config --print-errors --exists 'glib-2.0 >= 2.70' 'gobject-2.0 >= 2.70' \
+  'gio-2.0 >= 2.70' 'gdk-3.0 >= 3.22' 'webkit2gtk-4.1 >= 2.40'
+```
+
+Running the desktop app also requires a graphical desktop session. mise installs language toolchains, not these system libraries.
+
 ### Run in Development
 
 ```bash
@@ -112,6 +133,17 @@ cd sidex
 npm install
 npm run tauri dev
 ```
+
+For Bun with [mise](https://mise.jdx.dev/), run from the repository root:
+
+```bash
+mise trust
+mise install
+mise run setup
+mise run dev
+```
+
+The [mise configuration](./mise.toml) installs Bun, Node.js, Go, and Rust. The `dev` task installs JavaScript dependencies, builds the AI agent server, and launches Tauri with a Bun-based frontend startup command. Node.js is retained for the existing setup script and Vite heap settings. Linux still requires Tauri system build dependencies and a graphical desktop session.
 
 ### Build from Source
 
