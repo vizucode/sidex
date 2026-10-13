@@ -2,9 +2,13 @@
  *  MentionResolver — resolves @ mentions to file/folder/symbol content for Sidex Chat
  *--------------------------------------------------------------------------------------------*/
 
-import { URI } from '../../../../../base/common/uri.js';
+
 
 export type MentionType = 'file' | 'folder' | 'symbol' | 'url' | 'selection' | 'codebase';
+
+export interface FileUri {
+	fsPath: string;
+}
 
 export interface MentionItem {
 	type: MentionType;
@@ -16,9 +20,9 @@ export interface MentionItem {
 }
 
 interface IFileSystemProvider {
-	findFiles(pattern: string, maxResults: number): Promise<URI[]>;
-	readFile(uri: URI): Promise<string>;
-	readDirectory(uri: URI): Promise<Array<[string, 'file' | 'directory']>>;
+	findFiles(pattern: string, maxResults: number): Promise<FileUri[]>;
+	readFile(uri: FileUri): Promise<string>;
+	readDirectory(uri: FileUri): Promise<Array<[string, 'file' | 'directory']>>;
 	getWorkspaceFolderPath(): string | undefined;
 }
 
@@ -36,6 +40,7 @@ const FILE_EXTENSIONS: Record<string, string> = {
 };
 
 const MAX_SUGGESTIONS = 10;
+const MAX_SEARCH_RESULTS = 60;
 const MAX_FILE_LINES = 500;
 const TREE_DEPTH = 2;
 
@@ -110,70 +115,49 @@ export class MentionResolver {
 		return this.resolveCodebaseQuery(query);
 	}
 
+	private _itemFromUri(uri: FileUri): MentionItem {
+		const wsRoot = this._fsProvider.getWorkspaceFolderPath();
+		const fullPath = uri.fsPath;
+		const label = wsRoot ? this._relativePath(wsRoot, fullPath) : fullPath;
+		const ext = this._getExtension(label);
+		const isDir = !ext;
+		return {
+			type: isDir ? 'folder' : 'file',
+			label,
+			detail: isDir ? 'Folder' : `${FILE_EXTENSIONS[ext] || 'File'} · ${label}`,
+			fullPath,
+			iconClass: isDir ? 'codicon-folder' : 'codicon-file',
+		};
+	}
+
 	private async _getDefaultSuggestions(): Promise<MentionItem[]> {
-		const items: MentionItem[] = [];
-
-		// Suggest some common files from the workspace
 		try {
-			const uris = await this._fsProvider.findFiles('**/*', 15);
-			for (const uri of uris.slice(0, MAX_SUGGESTIONS)) {
-				const wsRoot = this._fsProvider.getWorkspaceFolderPath();
-				const fullPath = uri.fsPath;
-				const label = wsRoot ? fullPath.replace(wsRoot + '/', '') : fullPath;
-				const ext = this._getExtension(label);
-				items.push({
-					type: 'file',
-					label,
-					detail: FILE_EXTENSIONS[ext] || 'File',
-					fullPath,
-					iconClass: 'codicon-file',
-				});
-			}
+			const uris = await this._fsProvider.findFiles('**/*', MAX_SEARCH_RESULTS);
+			return uris.slice(0, MAX_SUGGESTIONS).map(uri => this._itemFromUri(uri));
 		} catch {
-			// workspace APIs unavailable
+			return [];
 		}
-
-		return items;
 	}
 
 	private async _searchFiles(query: string): Promise<MentionItem[]> {
-		const items: MentionItem[] = [];
-
+		const needle = query.toLowerCase().replace(/^\/+/, '');
 		try {
-			const glob = `**/*${query}*`;
-			const uris = await this._fsProvider.findFiles(glob, 30);
-
-			const wsRoot = this._fsProvider.getWorkspaceFolderPath();
-
-			for (const uri of uris) {
-				const fullPath = uri.fsPath;
-				const label = wsRoot ? fullPath.replace(wsRoot + '/', '') : fullPath;
-				const ext = this._getExtension(label);
-
-				const isDir = !ext;
-				items.push({
-					type: isDir ? 'folder' : 'file',
-					label,
-					detail: isDir ? 'Folder' : (FILE_EXTENSIONS[ext] || 'File'),
-					fullPath,
-					iconClass: isDir ? 'codicon-folder' : 'codicon-file',
-				});
-
-				if (items.length >= MAX_SUGGESTIONS) { break; }
-			}
+			const uris = await this._fsProvider.findFiles('**/*', MAX_SEARCH_RESULTS);
+			return uris
+				.map(uri => this._itemFromUri(uri))
+				.filter(item => item.label.toLowerCase().includes(needle) || this._basename(item.label).toLowerCase().includes(needle))
+				.sort((a, b) => this._scoreMention(a.label, needle) - this._scoreMention(b.label, needle) || a.label.localeCompare(b.label))
+				.slice(0, MAX_SUGGESTIONS);
 		} catch {
-			// search failed
+			return [];
 		}
-
-		return items;
 	}
 
 	private async _resolveFile(item: MentionItem): Promise<string> {
 		if (!item.fullPath) { return ''; }
 
 		try {
-			const uri = URI.file(item.fullPath);
-			const content = await this._fsProvider.readFile(uri);
+			const content = await this._fsProvider.readFile({ fsPath: item.fullPath });
 			const lines = content.split('\n');
 
 			if (lines.length <= MAX_FILE_LINES) {
@@ -193,15 +177,14 @@ export class MentionResolver {
 		if (!item.fullPath) { return ''; }
 
 		try {
-			const uri = URI.file(item.fullPath);
-			const tree = await this._buildTree(uri, TREE_DEPTH, '');
+			const tree = await this._buildTree({ fsPath: item.fullPath }, TREE_DEPTH, '');
 			return tree;
 		} catch {
 			return `[Could not read folder: ${item.label}]`;
 		}
 	}
 
-	private async _buildTree(uri: URI, depth: number, indent: string): Promise<string> {
+	private async _buildTree(uri: FileUri, depth: number, indent: string): Promise<string> {
 		if (depth <= 0) { return ''; }
 
 		const entries = await this._fsProvider.readDirectory(uri);
@@ -221,13 +204,33 @@ export class MentionResolver {
 			lines.push(`${indent}${icon} ${name}`);
 
 			if (type === 'directory' && depth > 1) {
-				const childUri = URI.joinPath(uri, name);
+				const childUri = { fsPath: `${uri.fsPath.replace(/\/$/, '')}/${name}` };
 				const subTree = await this._buildTree(childUri, depth - 1, indent + '  ');
 				if (subTree) { lines.push(subTree); }
 			}
 		}
 
 		return lines.join('\n');
+	}
+
+	private _relativePath(root: string, fullPath: string): string {
+		const normalizedRoot = root.replace(/\\/g, '/').replace(/\/$/, '');
+		const normalizedPath = fullPath.replace(/\\/g, '/');
+		return normalizedPath.startsWith(`${normalizedRoot}/`) ? normalizedPath.slice(normalizedRoot.length + 1) : fullPath;
+	}
+
+	private _basename(path: string): string {
+		return path.split(/[\\/]/).filter(Boolean).pop() || path;
+	}
+
+	private _scoreMention(label: string, needle: string): number {
+		const lower = label.toLowerCase();
+		const base = this._basename(lower);
+		if (base === needle) { return 0; }
+		if (base.startsWith(needle)) { return 1; }
+		if (lower.startsWith(needle)) { return 2; }
+		if (base.includes(needle)) { return 3; }
+		return 4;
 	}
 
 	private _getExtension(path: string): string {

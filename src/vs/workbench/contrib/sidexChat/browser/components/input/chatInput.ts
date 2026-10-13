@@ -6,7 +6,7 @@ import { ThemeIcon } from '../../../../../../base/common/themables.js';
 import { MentionPopup } from './mentionPopup.js';
 import { filterModelsForQuery } from './modelSearch.js';
 import { MentionResolver, MentionItem } from '../../context/mentionResolver.js';
-import { URI } from '../../../../../../base/common/uri.js';
+import { MentionFileSystemProvider } from '../../context/mentionFileSystemProvider.js';
 import { ISidexChatService } from '../../sidexChatService.js';
 
 export type AgentMode = 'agent' | 'plan' | 'ask';
@@ -21,6 +21,8 @@ interface ChatAttachment {
 	originalPath: string;
 	name: string;
 	kind: 'image' | 'file';
+	mimeType?: string;
+	size?: number;
 }
 
 type TauriInvoke = (cmd: string, args?: Record<string, unknown>) => Promise<unknown>;
@@ -47,10 +49,16 @@ export class ChatInput extends Component {
 	private _mentionPillsContainer: HTMLElement;
 	private _resolvedMentions: ResolvedMention[] = [];
 	private _attachmentsContainer: HTMLElement;
+	private _attachmentErrorEl: HTMLElement;
 	private _attachments: ChatAttachment[] = [];
 	private _dragDepth = 0;
 	private _mentionTracking: { active: boolean; startPos: number } = { active: false, startPos: -1 };
 	private _debounceTimer: ReturnType<typeof setTimeout> | null = null;
+	private _mentionSearchSeq = 0;
+	private static readonly SUPPORTED_ATTACHMENT_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.txt', '.md', '.json', '.yaml', '.yml', '.toml', '.csv', '.ts', '.tsx', '.js', '.jsx', '.css', '.html', '.py', '.go', '.rs', '.java', '.c', '.cpp', '.h', '.sh', '.sql']);
+	private static readonly SUPPORTED_ATTACHMENT_MIME_PREFIXES = ['image/'];
+	private static readonly SUPPORTED_ATTACHMENT_MIME_TYPES = new Set(['text/plain', 'text/markdown', 'application/json']);
+	private static readonly MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
 
 	private readonly _onSend = this._register(new Emitter<string>());
 	readonly onSend: Event<string> = this._onSend.event;
@@ -485,6 +493,8 @@ export class ChatInput extends Component {
 		// Mention pills container — sits above the textarea
 		this._mentionPillsContainer = DOM.append(container, $('div.sc-mention-pills'));
 		this._attachmentsContainer = DOM.append(container, $('div.sc-attachment-pills'));
+		this._attachmentErrorEl = DOM.append(container, $('div.sc-attachment-error'));
+		this._attachmentErrorEl.style.display = 'none';
 
 		this._textareaEl = DOM.append(container, $('textarea.sc-textarea')) as HTMLTextAreaElement;
 		this._textareaEl.placeholder = 'Plan, Build, / for commands, @ for context';
@@ -636,46 +646,14 @@ export class ChatInput extends Component {
 		this._stopBtn.style.display = 'none';
 
 		// Initialize mention system
-		this._mentionResolver = new MentionResolver({
-			findFiles: async (pattern: string, maxResults: number): Promise<URI[]> => {
-				try {
-					const vscode = (globalThis as any).vscode;
-					if (vscode?.workspace?.findFiles) {
-						return await vscode.workspace.findFiles(pattern, '**/node_modules/**', maxResults);
-					}
-				} catch { /* fallback */ }
-				return [];
+		this._mentionResolver = new MentionResolver(new MentionFileSystemProvider({
+			invoke: (command, args) => {
+				const tauriInvoke = this._getTauriInvoke();
+				if (!tauriInvoke) { return Promise.reject(new Error('Workspace file access is unavailable')); }
+				return tauriInvoke(command, args);
 			},
-			readFile: async (uri: URI): Promise<string> => {
-				try {
-					const vscode = (globalThis as any).vscode;
-					if (vscode?.workspace?.fs?.readFile) {
-						const bytes = await vscode.workspace.fs.readFile(uri);
-						return new TextDecoder().decode(bytes);
-					}
-				} catch { /* fallback */ }
-				return '';
-			},
-			readDirectory: async (uri: URI): Promise<Array<[string, 'file' | 'directory']>> => {
-				try {
-					const vscode = (globalThis as any).vscode;
-					if (vscode?.workspace?.fs?.readDirectory) {
-						const entries = await vscode.workspace.fs.readDirectory(uri);
-						return entries.map((e: [string, number]) => [e[0], e[1] === 2 ? 'directory' : 'file'] as [string, 'file' | 'directory']);
-					}
-				} catch { /* fallback */ }
-				return [];
-			},
-			getWorkspaceFolderPath: (): string | undefined => {
-				try {
-					const vscode = (globalThis as any).vscode;
-					if (vscode?.workspace?.workspaceFolders?.[0]) {
-						return vscode.workspace.workspaceFolders[0].uri.fsPath;
-					}
-				} catch { /* fallback */ }
-				return undefined;
-			},
-		});
+			getWorkspacePath: () => this._chatService.workspacePath,
+		}));
 
 		this._mentionPopup = new MentionPopup(this.element, (item) => this._onMentionSelected(item));
 		this._disposables.add(this._mentionPopup);
@@ -718,6 +696,10 @@ export class ChatInput extends Component {
 			this._autoResize();
 			this._syncSendButtonState();
 			this._handleMentionInput();
+		});
+
+		this.on(this._textareaEl, 'paste', (e) => {
+			void this._handlePaste(e as ClipboardEvent);
 		});
 
 		// Create the peeking bottom tray (Cursor/Windsurf style, rounded 8px)
@@ -1035,13 +1017,6 @@ export class ChatInput extends Component {
 
 		const query = textBefore.substring(atIndex + 1);
 
-		// A space within the query terminates the mention
-		if (query.includes(' ')) {
-			this._mentionTracking.active = false;
-			this._mentionPopup.hide();
-			return;
-		}
-
 		this._mentionTracking = { active: true, startPos: atIndex };
 		this._debouncedSearch(query);
 	}
@@ -1050,15 +1025,18 @@ export class ChatInput extends Component {
 		if (this._debounceTimer) {
 			clearTimeout(this._debounceTimer);
 		}
+		const searchSeq = ++this._mentionSearchSeq;
 		this._debounceTimer = setTimeout(async () => {
 			try {
 				const suggestions = await this._mentionResolver.getSuggestions(query);
-				if (!this._mentionTracking.active) { return; }
+				if (!this._mentionTracking.active || searchSeq !== this._mentionSearchSeq) { return; }
 
 				const anchorRect = this._getCaretRect();
 				this._mentionPopup.show(suggestions, anchorRect);
 			} catch {
-				this._mentionPopup.hide();
+				if (searchSeq === this._mentionSearchSeq) {
+					this._mentionPopup.hide();
+				}
 			}
 		}, 150);
 	}
@@ -1166,13 +1144,19 @@ export class ChatInput extends Component {
 
 	private async _addAttachments(paths: string[]): Promise<void> {
 		for (const path of paths) {
-			if (!path || this._attachments.some(a => a.path === path)) { continue; }
+			if (!path || this._attachments.some(a => a.originalPath === path || a.path === path)) { continue; }
+			const validation = this._validateAttachment(this._basename(path), undefined, undefined);
+			if (validation) {
+				this._showAttachmentError(validation);
+				continue;
+			}
 			const storedPath = await this._copyAttachmentToAssets(path);
 			const attachment: ChatAttachment = {
 				path: storedPath,
 				originalPath: path,
 				name: this._basename(path),
 				kind: this._isImagePath(path) ? 'image' : 'file',
+				mimeType: this._mimeFromPath(path),
 			};
 			this._attachments.push(attachment);
 			this._renderAttachmentPill(attachment);
@@ -1272,6 +1256,21 @@ export class ChatInput extends Component {
 		return transfer.files.length > 0 || Array.from(transfer.types).includes('Files');
 	}
 
+	private async _handlePaste(event: ClipboardEvent): Promise<void> {
+		const data = event.clipboardData;
+		if (!data) { return; }
+		const files = Array.from(data.files ?? []);
+		if (files.length === 0) {
+			const unsupported = Array.from(data.items ?? []).find(item => item.kind === 'file');
+			if (unsupported) {
+				this._showAttachmentError(`${unsupported.type || 'Clipboard file'} is not supported. Supported: images and text/code files; audio/video are not sent to the model.`);
+			}
+			return;
+		}
+		event.preventDefault();
+		await this._addFilePayloads(files, 'pasted');
+	}
+
 	private async _addDroppedFiles(event: DragEvent): Promise<void> {
 		const files = Array.from(event.dataTransfer?.files ?? []);
 		const pathBackedFiles: string[] = [];
@@ -1285,13 +1284,7 @@ export class ChatInput extends Component {
 			}
 		}
 		await this._addAttachments(pathBackedFiles);
-		for (const file of byteBackedFiles) {
-			const attachment = await this._attachmentFromDroppedBytes(file);
-			if (!attachment || this._attachments.some(a => a.path === attachment.path)) { continue; }
-			this._attachments.push(attachment);
-			this._renderAttachmentPill(attachment);
-		}
-		this._syncSendButtonState();
+		await this._addFilePayloads(byteBackedFiles, 'dropped');
 	}
 
 	private _pathFromDroppedFile(file: File): string | null {
@@ -1302,9 +1295,28 @@ export class ChatInput extends Component {
 		return null;
 	}
 
-	private async _attachmentFromDroppedBytes(file: File): Promise<ChatAttachment | null> {
+	private async _addFilePayloads(files: File[], source: 'dropped' | 'pasted'): Promise<void> {
+		for (const file of files) {
+			const attachment = await this._attachmentFromFileBytes(file, source);
+			if (!attachment || this._attachments.some(a => a.path === attachment.path)) { continue; }
+			this._attachments.push(attachment);
+			this._renderAttachmentPill(attachment);
+		}
+		this._syncSendButtonState();
+	}
+
+	private async _attachmentFromFileBytes(file: File, source: 'dropped' | 'pasted'): Promise<ChatAttachment | null> {
 		const invoke = this._getTauriInvoke();
-		if (!invoke) { return null; }
+		const sourceName = file.name || `${source}-${Date.now()}${this._extensionFromMime(file.type)}`;
+		const validation = this._validateAttachment(sourceName, file.type, file.size);
+		if (validation) {
+			this._showAttachmentError(validation);
+			return null;
+		}
+		if (!invoke) {
+			this._showAttachmentError('Attachment payloads need local SideX file access.');
+			return null;
+		}
 		try {
 			const osInfo = await invoke('get_os_info') as { homedir?: string };
 			const home = osInfo?.homedir;
@@ -1312,7 +1324,6 @@ export class ChatInput extends Component {
 			if (!home) { return null; }
 			const assetsDir = `${home}/.sidex/projects/${this._workspaceSlug(workspace)}/assets`;
 			await invoke('mkdir', { path: assetsDir, recursive: true });
-			const sourceName = file.name || `dropped-${Date.now()}`;
 			const assetPath = `${assetsDir}/${crypto.randomUUID()}${this._extension(sourceName)}`;
 			const content = Array.from(new Uint8Array(await file.arrayBuffer()));
 			await invoke('write_file_bytes', { path: assetPath, content });
@@ -1321,9 +1332,12 @@ export class ChatInput extends Component {
 				originalPath: sourceName,
 				name: sourceName,
 				kind: this._isImagePath(sourceName) || file.type.startsWith('image/') ? 'image' : 'file',
+				mimeType: file.type || this._mimeFromPath(sourceName),
+				size: file.size,
 			};
 		} catch (e) {
-			console.warn('[sidex-chat] failed to attach dropped file:', e);
+			console.warn('[sidex-chat] failed to attach file payload:', e);
+			this._showAttachmentError(`Could not attach ${sourceName}.`);
 			return null;
 		}
 	}
@@ -1351,20 +1365,62 @@ export class ChatInput extends Component {
 
 	private _mimeFromPath(path: string): string {
 		const lowered = path.toLowerCase();
+		if (lowered.endsWith('.png')) { return 'image/png'; }
 		if (lowered.endsWith('.jpg') || lowered.endsWith('.jpeg')) { return 'image/jpeg'; }
 		if (lowered.endsWith('.gif')) { return 'image/gif'; }
 		if (lowered.endsWith('.webp')) { return 'image/webp'; }
-		return 'image/png';
+		if (lowered.endsWith('.json')) { return 'application/json'; }
+		if (lowered.endsWith('.md')) { return 'text/markdown'; }
+		return 'text/plain';
+	}
+
+	private _extensionFromMime(mimeType: string): string {
+		if (mimeType === 'image/png') { return '.png'; }
+		if (mimeType === 'image/jpeg') { return '.jpg'; }
+		if (mimeType === 'image/gif') { return '.gif'; }
+		if (mimeType === 'image/webp') { return '.webp'; }
+		if (mimeType === 'application/json') { return '.json'; }
+		if (mimeType.startsWith('text/')) { return '.txt'; }
+		return '';
+	}
+
+	private _validateAttachment(name: string, mimeType?: string, size?: number): string | null {
+		if (typeof size === 'number' && size > ChatInput.MAX_ATTACHMENT_BYTES) {
+			return `${name} is too large. Maximum attachment size is 25 MB.`;
+		}
+		const ext = this._extension(name).toLowerCase();
+		const supportedMime = !!mimeType && (ChatInput.SUPPORTED_ATTACHMENT_MIME_TYPES.has(mimeType) || ChatInput.SUPPORTED_ATTACHMENT_MIME_PREFIXES.some(prefix => mimeType.startsWith(prefix)));
+		if (!ChatInput.SUPPORTED_ATTACHMENT_EXTENSIONS.has(ext) && !supportedMime) {
+			return `${name || 'Attachment'} is not supported. Supported: images and text/code files; audio/video are not sent to the model.`;
+		}
+		return null;
+	}
+
+	private _showAttachmentError(message: string): void {
+		this._attachmentErrorEl.textContent = message;
+		this._attachmentErrorEl.style.display = '';
+		setTimeout(() => {
+			if (this._attachmentErrorEl.textContent === message) {
+				this._attachmentErrorEl.style.display = 'none';
+			}
+		}, 6000);
 	}
 
 	private _buildAttachmentContext(): string {
 		if (this._attachments.length === 0) { return ''; }
 		const lines = [
 			'<attachments>',
-			'The user attached these local files. They were copied into the SideX project assets directory. Use read_file before making claims about their contents; read_file supports both text/code files and image files.',
+			'The user attached these local files. They were copied into the SideX project assets directory. Use read_file before making claims about their contents; read_file supports text/code files and image files only.',
 		];
 		for (const attachment of this._attachments) {
-			lines.push(`- ${attachment.kind}: ${attachment.path} (name: ${attachment.name}, original: ${attachment.originalPath}, use read_file)`);
+			const meta = [
+				`name: ${attachment.name}`,
+				`original: ${attachment.originalPath}`,
+				attachment.mimeType ? `mime: ${attachment.mimeType}` : '',
+				typeof attachment.size === 'number' ? `size: ${attachment.size}` : '',
+				'use read_file',
+			].filter(Boolean).join(', ');
+			lines.push(`- ${attachment.kind}: ${attachment.path} (${meta})`);
 		}
 		lines.push('</attachments>', '');
 		return lines.join('\n');
@@ -1372,7 +1428,10 @@ export class ChatInput extends Component {
 
 	private async _copyAttachmentToAssets(sourcePath: string): Promise<string> {
 		const invoke = this._getTauriInvoke();
-		if (!invoke) { return sourcePath; }
+		if (!invoke) {
+			this._showAttachmentError('Attachment could not be copied; model may not be able to read local path.');
+			return sourcePath;
+		}
 		try {
 			const osInfo = await invoke('get_os_info') as { homedir?: string };
 			const home = osInfo?.homedir;
@@ -1388,6 +1447,7 @@ export class ChatInput extends Component {
 			return assetPath;
 		} catch (e) {
 			console.warn('[sidex-chat] failed to copy attachment into assets:', e);
+			this._showAttachmentError(`Could not attach ${this._basename(sourcePath)}.`);
 			return sourcePath;
 		}
 	}
@@ -1468,6 +1528,7 @@ export class ChatInput extends Component {
 		DOM.clearNode(this._mentionPillsContainer);
 		this._mentionPillsContainer.style.display = 'none';
 		DOM.clearNode(this._attachmentsContainer);
+		this._attachmentErrorEl.style.display = 'none';
 
 		this._onSendWithMentions.fire({ text: fullMessage, mentions: mentionsCopy });
 		this._onSend.fire(fullMessage);
